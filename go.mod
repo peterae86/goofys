@@ -17,7 +17,6 @@ require (
 	github.com/go-ole/go-ole v1.2.4 // indirect
 	github.com/google/uuid v1.1.1
 	github.com/jacobsa/fuse v0.0.0-20191211084903-4898d79241b8
-	github.com/kahing/go-xattr v1.1.1 // indirect
 	github.com/kardianos/osext v0.0.0-20190222173326-2bc1f35cddc0
 	github.com/kylelemons/godebug v1.1.0 // indirect
 	github.com/mitchellh/go-homedir v1.1.0
@@ -32,5 +31,6 @@ require (
 	golang.org/x/sys v0.0.0-20191224085550-c709ea063b76
 	gopkg.in/check.v1 v1.0.0-20190902080502-41f04d3bba15
 	gopkg.in/ini.v1 v1.51.0
-	launchpad.net/gocheck v0.0.0-20140225173054-000000000087 // indirect
 )
+
+replace github.com/jacobsa/fuse => github.com/kahing/fusego v0.0.0-20191210234239-374cf4208103
