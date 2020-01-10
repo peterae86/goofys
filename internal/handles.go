@@ -479,13 +479,13 @@ func (inode *Inode) ListXattr() ([]string, error) {
 	return xattrs, nil
 }
 
-func (inode *Inode) OpenFile(metadata fuseops.OpMetadata) (fh *FileHandle, err error) {
+func (inode *Inode) OpenFile(metadata fuseops.OpMetadata) (fh FileHandle, err error) {
 	inode.logFuse("OpenFile")
 
 	inode.mu.Lock()
 	defer inode.mu.Unlock()
 
-	fh = NewFileHandle(inode, metadata)
+	fh = NewSeqFileHandle(inode, metadata)
 	inode.fileHandles += 1
 	return
 }

@@ -83,7 +83,7 @@ type Goofys struct {
 	nextHandleID fuseops.HandleID
 	dirHandles   map[fuseops.HandleID]*DirHandle
 
-	fileHandles map[fuseops.HandleID]*FileHandle
+	fileHandles map[fuseops.HandleID]FileHandle
 
 	replicators *Ticket
 	restorers   *Ticket
@@ -893,18 +893,18 @@ func (fs *Goofys) FlushFile(
 	// incoming request's tgid matches the tgid in the file handle.
 	// This check helps us with scenarios like https://github.com/peterae86/goofys/issues/273
 	// Also see goofys_test.go:TestClientForkExec.
-	if fh.Tgid != nil {
+	if fh.GetTgid() != nil {
 		tgid, err := GetTgid(op.Metadata.Pid)
 		if err != nil {
-			fh.inode.logFuse("<-- FlushFile",
+			fh.GetInode().logFuse("<-- FlushFile",
 				fmt.Sprintf("Failed to retrieve tgid from op.Metadata.Pid. FlushFileOp:%#v, err:%v",
 					op, err))
 			return fuse.EIO
 		}
-		if *fh.Tgid != *tgid {
-			fh.inode.logFuse("<-- FlushFile",
+		if *fh.GetTgid() != *tgid {
+			fh.GetInode().logFuse("<-- FlushFile",
 				"Operation ignored",
-				fmt.Sprintf("fh.Pid:%v != tgid:%v, op:%#v", *fh.Tgid, *tgid, op))
+				fmt.Sprintf("fh.Pid:%v != tgid:%v, op:%#v", *fh.GetTgid(), *tgid, op))
 			return nil
 		}
 	}
@@ -925,7 +925,7 @@ func (fs *Goofys) FlushFile(
 		}
 
 	}
-	fh.inode.logFuse("<-- FlushFile", err, op.Handle, op.Inode)
+	fh.GetInode().logFuse("<-- FlushFile", err, op.Handle, op.Inode)
 	return
 }
 
@@ -937,7 +937,7 @@ func (fs *Goofys) ReleaseFileHandle(
 	fh := fs.fileHandles[op.Handle]
 	fh.Release()
 
-	fuseLog.Debugln("ReleaseFileHandle", *fh.inode.FullName(), op.Handle, fh.inode.Id)
+	fuseLog.Debugln("ReleaseFileHandle", *fh.GetInode().FullName(), op.Handle, fh.GetInode().Id)
 
 	delete(fs.fileHandles, op.Handle)
 
@@ -1139,5 +1139,13 @@ func (fs *Goofys) Rename(
 
 func (fs *Goofys) Fallocate(ctx context.Context, op *fuseops.FallocateOp) (err error) {
 	fuseLog.Debugf("<-- Fallocate %v %v %v", op.Mode, op.Length, err)
+	fh, ok := fs.fileHandles[op.Handle]
+	if !ok {
+		panic(fmt.Sprintf("WriteFile: can't find handle %v", op.Handle))
+	}
+	fh.IsFallocateWrite = true
+	fh.inode.Attributes.Size = op.Length
+	fh.buf = MBuf{}.Init(fh.poolHandle, op.Length, true)
+	fh.lastPartId = uint32(len(fh.buf.buffers) - 1)
 	return
 }

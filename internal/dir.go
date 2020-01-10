@@ -887,7 +887,7 @@ func (parent *Inode) Unlink(name string) (err error) {
 }
 
 func (parent *Inode) Create(
-	name string, metadata fuseops.OpMetadata) (inode *Inode, fh *FileHandle) {
+	name string, metadata fuseops.OpMetadata) (inode *Inode, fh FileHandle) {
 
 	parent.logFuse("Create", name)
 
@@ -903,13 +903,13 @@ func (parent *Inode) Create(
 		Mtime: now,
 	}
 
-	fh = NewFileHandle(inode, metadata)
-	fh.poolHandle = fs.bufferPool
-	fh.dirty = true
+	sfh := NewSeqFileHandle(inode, metadata)
+	sfh.poolHandle = fs.bufferPool
+	sfh.dirty = true
 	inode.fileHandles = 1
 
 	parent.touch()
-
+	fh = sfh
 	return
 }
 

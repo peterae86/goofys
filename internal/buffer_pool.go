@@ -16,13 +16,13 @@ package internal
 
 import (
 	. "github.com/peterae86/goofys/api/common"
+	"sort"
 
 	"io"
 	"runtime"
 	"runtime/debug"
 	"sync"
 
-	"github.com/jacobsa/fuse"
 	"github.com/shirou/gopsutil/mem"
 )
 
@@ -94,9 +94,9 @@ func NewBufferPool(maxSizeGlobal uint64) *BufferPool {
 	return pool
 }
 
-func (pool *BufferPool) RequestBuffer() (buf []byte) {
-	return pool.RequestMultiple(BUF_SIZE, true)[0]
-}
+//func (pool *BufferPool) RequestBuffer() (buf []byte) {
+//	return pool.RequestMultiple(BUF_SIZE, true)[0]
+//}
 
 func (pool *BufferPool) recomputeBufferLimit() {
 	if pool.maxBuffers == 0 {
@@ -107,7 +107,7 @@ func (pool *BufferPool) recomputeBufferLimit() {
 	}
 }
 
-func (pool *BufferPool) RequestMultiple(size uint64, block bool) (buffers [][]byte) {
+func (pool *BufferPool) RequestMultiple(size uint64, block bool) (buffers []*InnerBuf) {
 	nPages := pages(size, BUF_SIZE)
 
 	pool.mu.Lock()
@@ -143,7 +143,23 @@ func (pool *BufferPool) RequestMultiple(size uint64, block bool) (buffers [][]by
 		pool.numBuffers++
 		pool.totalBuffers++
 		buf := pool.pool.Get()
-		buffers = append(buffers, buf.([]byte))
+		if i != nPages-1 {
+			buffers = append(buffers, &InnerBuf{
+				buffer: buf.([]byte),
+				cap:    BUF_SIZE,
+				wmap: &IntervalSet{
+					imap: map[int]int{},
+				},
+			})
+		} else {
+			buffers = append(buffers, &InnerBuf{
+				buffer: buf.([]byte),
+				cap:    int(size) - (nPages-1)*BUF_SIZE,
+				wmap: &IntervalSet{
+					imap: map[int]int{},
+				},
+			})
+		}
 	}
 	return
 }
@@ -167,162 +183,220 @@ func (pool *BufferPool) Free(buf []byte) {
 
 var mbufLog = GetLogger("mbuf")
 
+type IntervalSet struct {
+	imap map[int]int
+	keys []int
+}
+
+func (is *IntervalSet) insert(a, b int) {
+	if v, ok := is.imap[a]; !ok || b > v {
+		is.imap[a] = b
+		if !ok {
+			is.keys = append(is.keys, a)
+			sort.Ints(is.keys)
+		}
+	}
+}
+
+func (is *IntervalSet) len() int {
+	var preB int
+	var total int
+	for _, a := range is.keys {
+		b := is.imap[a]
+		if a >= preB {
+			total += b - a
+		} else {
+			if b > preB {
+				total += b - preB
+			}
+		}
+		if b > preB {
+			preB = b
+		}
+	}
+	return total
+}
+
+type InnerBuf struct {
+	buffer []byte
+	wmap   *IntervalSet
+	length int
+	cap    int
+	rp     int
+}
+
 type MBuf struct {
 	pool    *BufferPool
-	buffers [][]byte
-	rbuf    int
-	wbuf    int
-	rp      int
-	wp      int
+	buffers []*InnerBuf
+	rbufs   map[int64]bool
+	wbufs   map[int64]bool
+	rp      int64
+	size    int64
 }
 
 func (mb MBuf) Init(h *BufferPool, size uint64, block bool) *MBuf {
 	mb.pool = h
+	mb.size = BUF_SIZE
 
 	if size != 0 {
 		mb.buffers = h.RequestMultiple(size, block)
 		if mb.buffers == nil {
 			return nil
 		}
+		mb.wbufs = map[int64]bool{}
+		mb.rbufs = map[int64]bool{}
 	}
 
 	return &mb
 }
 
-func (mb *MBuf) Len() (length int) {
-	for i := mb.rbuf; i < int(len(mb.buffers)); i++ {
-		var bufSize int
-		var start int
-		if i == mb.wbuf {
-			bufSize = mb.wp
-		} else {
-			bufSize = int(len(mb.buffers[i]))
-		}
+//func (mb *MBuf) Len() (length int) {
+//	for _, v := range mb.buffers {
+//		if v != nil {
+//			length += v.wp - v.rp
+//		}
+//	}
+//	return
+//}
 
-		if i == mb.rbuf {
-			start = mb.rp
-		} else {
-			start = 0
-		}
+//// seek only seeks the reader
+//func (mb *MBuf) Seek(offset int64, whence int) (int64, error) {
+//	switch whence {
+//	case 0: // relative to beginning
+//		if offset == 0 {
+//			mb.rbuf = 0
+//			mb.rp = 0
+//			return 0, nil
+//		}
+//	case 1: // relative to current position
+//		if offset == 0 {
+//			for i := 0; i < mb.rbuf; i++ {
+//				offset += int64(len(mb.buffers[i]))
+//			}
+//			offset += int64(mb.rp)
+//			return offset, nil
+//		}
+//
+//	case 2: // relative to the end
+//		if offset == 0 {
+//			for i := 0; i < len(mb.buffers); i++ {
+//				offset += int64(len(mb.buffers[i]))
+//			}
+//			mb.rbuf = len(mb.buffers)
+//			mb.rp = 0
+//			return offset, nil
+//		}
+//	}
+//
+//	log.Errorf("Seek %d %d", offset, whence)
+//	panic(fuse.EINVAL)
+//
+//	return 0, fuse.EINVAL
+//}
 
-		length += bufSize - start
+func (mb *MBuf) Read(p []byte) (n int, err error) {
+	part := mb.rp / mb.size
+	n, err = mb.ReadPart(part, p)
+	if err != nil {
+		return
 	}
-
+	mb.rp += int64(n)
 	return
 }
 
-// seek only seeks the reader
-func (mb *MBuf) Seek(offset int64, whence int) (int64, error) {
-	switch whence {
-	case 0: // relative to beginning
-		if offset == 0 {
-			mb.rbuf = 0
-			mb.rp = 0
-			return 0, nil
-		}
-	case 1: // relative to current position
-		if offset == 0 {
-			for i := 0; i < mb.rbuf; i++ {
-				offset += int64(len(mb.buffers[i]))
-			}
-			offset += int64(mb.rp)
-			return offset, nil
-		}
-
-	case 2: // relative to the end
-		if offset == 0 {
-			for i := 0; i < len(mb.buffers); i++ {
-				offset += int64(len(mb.buffers[i]))
-			}
-			mb.rbuf = len(mb.buffers)
-			mb.rp = 0
-			return offset, nil
-		}
+//
+func (mb *MBuf) ReadPart(part int64, p []byte) (n int, err error) {
+	if int(part) >= len(mb.buffers) {
+		err = io.EOF
+		return
 	}
-
-	log.Errorf("Seek %d %d", offset, whence)
-	panic(fuse.EINVAL)
-
-	return 0, fuse.EINVAL
-}
-
-func (mb *MBuf) Read(p []byte) (n int, err error) {
-	if mb.rbuf == mb.wbuf && mb.rp == mb.wp {
+	b := mb.buffers[part]
+	if b.rp == len(b.buffer) {
 		err = io.EOF
 		return
 	}
 
-	if mb.rp == cap(mb.buffers[mb.rbuf]) {
-		mb.rbuf++
-		mb.rp = 0
+	if b.rp == cap(b.buffer) {
+		mb.rbufs[part] = true
 	}
 
-	if mb.rbuf == len(mb.buffers) {
+	if len(mb.rbufs) == len(mb.buffers) {
 		err = io.EOF
 		return
-	} else if mb.rbuf > len(mb.buffers) {
+	} else if len(mb.rbufs) > len(mb.buffers) {
 		panic("mb.cur > len(mb.buffers)")
 	}
 
-	n = copy(p, mb.buffers[mb.rbuf][mb.rp:])
-	mb.rp += n
+	n = copy(p, b.buffer[b.rp:])
+	b.rp += n
 
 	return
 }
 
 func (mb *MBuf) Full() bool {
-	return mb.buffers == nil || (mb.wp == cap(mb.buffers[mb.wbuf]) && mb.wbuf+1 == len(mb.buffers))
+	return mb.buffers == nil || len(mb.wbufs) == len(mb.buffers)
 }
 
-func (mb *MBuf) Write(p []byte) (n int, err error) {
-	b := mb.buffers[mb.wbuf]
+func (mb *MBuf) Write(offset int64, p []byte, writePartFullCallback func(part int64)) (n int, err error) {
+	part := offset / mb.size
+	b := mb.buffers[part]
 
-	if mb.wp == cap(b) {
-		if mb.wbuf+1 == len(mb.buffers) {
-			return
-		}
-		mb.wbuf++
-		b = mb.buffers[mb.wbuf]
-		mb.wp = 0
-	} else if mb.wp > cap(b) {
-		panic("mb.wp > cap(b)")
-	}
-
-	n = copy(b[mb.wp:cap(b)], p)
-	mb.wp += n
+	//if b.wp == cap(b.buffer) {
+	//	return
+	//} else if b.wp > cap(b.buffer) {
+	//	panic("mb.wp > cap(b)")
+	//}
+	start := int(offset - mb.size*part)
+	n = copy(b.buffer[start:cap(b.buffer)], p)
 	// resize the buffer to account for what we just read
-	mb.buffers[mb.wbuf] = mb.buffers[mb.wbuf][:mb.wp]
-
+	if start+n > b.length {
+		b.length = start + n
+		b.buffer = b.buffer[:b.length]
+	}
+	b.wmap.insert(start, start+n)
+	if b.wmap.len() == b.cap {
+		if writePartFullCallback != nil {
+			writePartFullCallback(part)
+		}
+		mb.wbufs[part] = true
+	}
+	if n < len(p) {
+		return mb.Write(offset+int64(n), p[n:], writePartFullCallback)
+	}
 	return
 }
 
-func (mb *MBuf) WriteFrom(r io.Reader) (n int, err error) {
-	b := mb.buffers[mb.wbuf]
+func (mb *MBuf) WriteFrom(offset int64, r io.Reader) (n int, err error) {
+	part := offset / mb.size
+	b := mb.buffers[part]
 
-	if mb.wp == cap(b) {
-		if mb.wbuf+1 == len(mb.buffers) {
-			return
-		}
-		mb.wbuf++
-		b = mb.buffers[mb.wbuf]
-		mb.wp = 0
-	} else if mb.wp > cap(b) {
-		panic("mb.wp > cap(b)")
-	}
-
-	n, err = r.Read(b[mb.wp:cap(b)])
-	mb.wp += n
+	n, err = r.Read(b.buffer[offset-part*mb.size : cap(b.buffer)])
+	b.wmap.insert(int(offset-mb.size*part), int(offset-mb.size*part)+n)
 	// resize the buffer to account for what we just read
-	mb.buffers[mb.wbuf] = mb.buffers[mb.wbuf][:mb.wp]
-
-	return
+	if int(offset-mb.size*part)+n > b.length {
+		b.length = int(offset-mb.size*part) + n
+		b.buffer = b.buffer[:int(offset-mb.size*part)+n]
+	}
+	if b.wmap.len() == b.cap {
+		mb.wbufs[part] = true
+	}
+	if n > 0 {
+		return mb.WriteFrom(offset+int64(n), r)
+	} else {
+		return 0, nil
+	}
 }
 
 func (mb *MBuf) Reset() {
-	mb.rbuf = 0
-	mb.wbuf = 0
-	mb.rp = 0
-	mb.wp = 0
+	mb.rbufs = map[int64]bool{}
+	mb.wbufs = map[int64]bool{}
+	for _, v := range mb.buffers {
+		if v != nil {
+			v.wmap = &IntervalSet{
+				imap: map[int]int{},
+			}
+		}
+	}
 }
 
 func (mb *MBuf) Close() error {
@@ -332,10 +406,14 @@ func (mb *MBuf) Close() error {
 
 func (mb *MBuf) Free() {
 	for _, b := range mb.buffers {
-		mb.pool.Free(b)
+		mb.pool.Free(b.buffer)
 	}
 
 	mb.buffers = nil
+}
+
+func (mb *MBuf) FreePart(part int64) {
+	mb.pool.Free(mb.buffers[part].buffer)
 }
 
 var bufferLog = GetLogger("buffer")
@@ -363,6 +441,7 @@ func (b Buffer) Init(buf *MBuf, r ReaderProvider) *Buffer {
 }
 
 func (b *Buffer) readLoop(r ReaderProvider) {
+	offset := int64(0)
 	for {
 		b.mu.Lock()
 		if b.reader == nil {
@@ -380,7 +459,8 @@ func (b *Buffer) readLoop(r ReaderProvider) {
 			break
 		}
 
-		nread, err := b.buf.WriteFrom(b.reader)
+		nread, err := b.buf.WriteFrom(offset, b.reader)
+		offset += int64(nread)
 		if err != nil {
 			b.err = err
 			b.mu.Unlock()
