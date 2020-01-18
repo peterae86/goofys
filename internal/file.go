@@ -15,7 +15,6 @@
 package internal
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -139,18 +138,19 @@ func (fh *SeqFileHandle) mpuPartNoSpawn(buf *MBuf, part uint32, total int64, las
 		return errors.New(fmt.Sprintf("invalid part number: %v", part))
 	}
 
-	var mpu = MultipartBlobAddInput{
+	mpu := MultipartBlobAddInput{
 		Commit:     fh.mpuId,
 		PartNumber: part,
-		Body:       bytes.NewReader(buf.buffers[part-1].buffer),
-		//Size:       uint64(buf.Len()),
-		//Last:       last,
-		//Offset:     uint64(total - int64(buf.Len())),
+		Body:       buf,
+		Size:       uint64(buf.Len()),
+		Last:       last,
+		Offset:     uint64(total - int64(buf.Len())),
 	}
+
 	defer func() {
 		if mpu.Body != nil {
 			bufferLog.Debugf("Free %T", buf)
-			buf.FreePart(int64(part - 1))
+			buf.Free()
 		}
 	}()
 
@@ -238,36 +238,6 @@ func (fh *SeqFileHandle) uploadCurrentBuf(parallel bool) (err error) {
 	return
 }
 
-func (fh *SeqFileHandle) WriteFileMultipart(offset int64, data []byte) (err error) {
-	fh.inode.logFuse("WriteFileMultipart", offset, len(data))
-
-	fh.mu.Lock()
-	defer fh.mu.Unlock()
-
-	err = fh.waitForCreateMPU()
-	if err != nil {
-		return
-	}
-
-	if fh.lastWriteError != nil {
-		return fh.lastWriteError
-	}
-
-	if fh.buf == nil {
-		fh.buf = MBuf{}.Init(fh.poolHandle, fh.partSize(), true)
-	}
-
-	_, _ = fh.buf.Write(offset, data, func(part int64) {
-		if !fh.buf.wbufs[part] {
-			err = fh.mpuPartNoSpawn(fh.buf, uint32(part+1), BUF_SIZE, false)
-			if err == nil {
-				fh.buf.wbufs[part] = true
-			}
-		}
-	})
-	return
-}
-
 func (fh *SeqFileHandle) WriteFile(offset int64, data []byte) (err error) {
 	fh.inode.logFuse("WriteFile", offset, len(data))
 
@@ -294,7 +264,7 @@ func (fh *SeqFileHandle) WriteFile(offset int64, data []byte) (err error) {
 			fh.buf = MBuf{}.Init(fh.poolHandle, fh.partSize(), true)
 		}
 
-		nCopied, _ := fh.buf.Write(fh.nextWriteOffset, data, nil)
+		nCopied, _ := fh.buf.Write(data)
 		fh.nextWriteOffset += int64(nCopied)
 
 		if fh.buf.Full() {
@@ -514,10 +484,6 @@ func (fh *SeqFileHandle) ReadFile(offset int64, buf []byte) (bytesRead int, err 
 		if nread > 0 {
 			bytesRead += nread
 		}
-		if err != nil {
-			return
-		}
-		fh.inode.logFuse(fmt.Sprintf("< readFile bytesRead:%v nwant:%v", bytesRead, nwant))
 	}
 
 	return
@@ -615,7 +581,7 @@ func (fh *SeqFileHandle) Release() {
 	if fh.poolHandle != nil {
 		if fh.buf != nil && fh.buf.buffers != nil {
 			if fh.lastWriteError == nil {
-				//panic("buf not freed but error is nil")
+				panic("buf not freed but error is nil")
 			}
 
 			fh.buf.Free()
@@ -666,9 +632,7 @@ func (fh *SeqFileHandle) readFromStream(offset int64, buf []byte) (bytesRead int
 		// always retry error on read
 		fh.reader.Close()
 		fh.reader = nil
-		if err != io.EOF {
-			err = nil
-		}
+		err = nil
 	}
 
 	return
@@ -691,16 +655,10 @@ func (fh *SeqFileHandle) flushSmallFile() (err error) {
 
 	// we want to get key from inode because the file could have been renamed
 	_, key := fh.inode.cloud()
-
-	var bf []byte
-	if len(buf.buffers) > 0 {
-		bf = buf.buffers[0].buffer
-	}
-
 	resp, err := fh.cloud.PutBlob(&PutBlobInput{
 		Key:         key,
-		Body:        bytes.NewReader(bf),
-		Size:        PUInt64(uint64(len(bf))),
+		Body:        buf,
+		Size:        PUInt64(uint64(buf.Len())),
 		ContentType: fs.flags.GetMimeType(*fh.inode.FullName()),
 	})
 	if err != nil {
@@ -784,17 +742,15 @@ func (fh *SeqFileHandle) FlushFile() (err error) {
 		return
 	}
 
-	if !fh.IsFallocateWrite {
-		nParts := fh.lastPartId
-		if fh.buf != nil {
-			// upload last part
-			nParts++
-			err = fh.mpuPartNoSpawn(fh.buf, nParts, fh.nextWriteOffset, true)
-			if err != nil {
-				return
-			}
-			fh.buf = nil
+	nParts := fh.lastPartId
+	if fh.buf != nil {
+		// upload last part
+		nParts++
+		err = fh.mpuPartNoSpawn(fh.buf, nParts, fh.nextWriteOffset, true)
+		if err != nil {
+			return
 		}
+		fh.buf = nil
 	}
 
 	_, err = fh.cloud.MultipartBlobCommit(fh.mpuId)

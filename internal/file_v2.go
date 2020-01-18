@@ -20,22 +20,15 @@ type RandomWriteFileHandle struct {
 	writeInit sync.Once
 	mpuWG     sync.WaitGroup
 
-	mu              sync.Mutex
-	mpuId           *MultipartBlobCommitInput
-	nextWriteOffset int64
-	lastPartId      uint32
+	mu         sync.Mutex
+	mpuId      *MultipartBlobCommitInput
+	lastPartId uint32
 
 	poolHandle *BufferPool
 	buf        *MBuf
 
 	lastWriteError error
 
-	// read
-	reader        io.ReadCloser
-	readBufOffset int64
-
-	// parallel read
-	buffers           []*S3ReadBuffer
 	existingReadahead int
 	seqReadAmount     uint64
 	numOOORead        uint64 // number of out of order read
@@ -45,8 +38,6 @@ type RandomWriteFileHandle struct {
 	// [1] : https://godoc.org/github.com/shirou/gopsutil/process#Process.Tgid
 	// [2] : https://github.com/shirou/gopsutil#process-class
 	Tgid *int32
-
-	IsFallocateWrite bool
 }
 
 func (fh *RandomWriteFileHandle) initWrite() {
@@ -166,30 +157,6 @@ func (fh *RandomWriteFileHandle) partSize() uint64 {
 	return size
 }
 
-func (fh *RandomWriteFileHandle) uploadCurrentBuf(parallel bool) (err error) {
-	err = fh.waitForCreateMPU()
-	if err != nil {
-		return
-	}
-
-	fh.lastPartId++
-	part := fh.lastPartId
-	buf := fh.buf
-	fh.buf = nil
-
-	if parallel {
-		fh.mpuWG.Add(1)
-		go fh.mpuPart(buf, part, fh.nextWriteOffset)
-	} else {
-		err = fh.mpuPartNoSpawn(buf, part, fh.nextWriteOffset, false)
-		if fh.lastWriteError == nil {
-			fh.lastWriteError = err
-		}
-	}
-
-	return
-}
-
 func (fh *RandomWriteFileHandle) WriteFileMultipart(offset int64, data []byte) (err error) {
 	fh.inode.logFuse("WriteFileMultipart", offset, len(data))
 
@@ -217,54 +184,6 @@ func (fh *RandomWriteFileHandle) WriteFileMultipart(offset int64, data []byte) (
 			}
 		}
 	})
-	return
-}
-
-func (fh *RandomWriteFileHandle) WriteFile(offset int64, data []byte) (err error) {
-	fh.inode.logFuse("WriteFile", offset, len(data))
-
-	fh.mu.Lock()
-	defer fh.mu.Unlock()
-
-	if fh.lastWriteError != nil {
-		return fh.lastWriteError
-	}
-
-	if offset != fh.nextWriteOffset {
-		fh.inode.errFuse("WriteFile: only sequential writes supported", fh.nextWriteOffset, offset)
-		fh.lastWriteError = syscall.ENOTSUP
-		return fh.lastWriteError
-	}
-
-	if offset == 0 {
-		fh.poolHandle = fh.inode.fs.bufferPool
-		fh.dirty = true
-	}
-
-	for {
-		if fh.buf == nil {
-			fh.buf = MBuf{}.Init(fh.poolHandle, fh.partSize(), true)
-		}
-
-		nCopied, _ := fh.buf.Write(fh.nextWriteOffset, data, nil)
-		fh.nextWriteOffset += int64(nCopied)
-
-		if fh.buf.Full() {
-			err = fh.uploadCurrentBuf(!fh.cloud.Capabilities().NoParallelMultipart)
-			if err != nil {
-				return
-			}
-		}
-
-		if nCopied == len(data) {
-			break
-		}
-
-		data = data[nCopied:]
-	}
-
-	fh.inode.Attributes.Size = uint64(fh.nextWriteOffset)
-
 	return
 }
 
@@ -349,14 +268,6 @@ func (fh *RandomWriteFileHandle) readFile(offset int64, buf []byte) (bytesRead i
 
 func (fh *RandomWriteFileHandle) Release() {
 	// read buffers
-	for _, b := range fh.buffers {
-		b.buf.Close()
-	}
-	fh.buffers = nil
-
-	if fh.reader != nil {
-		fh.reader.Close()
-	}
 
 	// write buffers
 	if fh.poolHandle != nil {
