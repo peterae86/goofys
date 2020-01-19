@@ -1,13 +1,11 @@
 package internal
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"github.com/jacobsa/fuse"
 	"io"
 	"sync"
-	"syscall"
 )
 
 type RandomWriteFileHandle struct {
@@ -24,8 +22,7 @@ type RandomWriteFileHandle struct {
 	mpuId      *MultipartBlobCommitInput
 	lastPartId uint32
 
-	poolHandle *BufferPool
-	buf        *MBuf
+	buf *LocalFileBuf
 
 	lastWriteError error
 
@@ -38,6 +35,14 @@ type RandomWriteFileHandle struct {
 	// [1] : https://godoc.org/github.com/shirou/gopsutil/process#Process.Tgid
 	// [2] : https://github.com/shirou/gopsutil#process-class
 	Tgid *int32
+}
+
+func (fh *RandomWriteFileHandle) GetInode() *Inode {
+	return fh.inode
+}
+
+func (fh *RandomWriteFileHandle) GetTgid() *int32 {
+	return fh.Tgid
 }
 
 func (fh *RandomWriteFileHandle) initWrite() {
@@ -72,56 +77,51 @@ func (fh *RandomWriteFileHandle) initMPU() {
 	return
 }
 
-func (fh *RandomWriteFileHandle) mpuPartNoSpawn(buf *MBuf, part uint32, total int64, last bool) (err error) {
+func (fh *RandomWriteFileHandle) mpuPartNoSpawn(part int) (err error) {
 	fs := fh.inode.fs
 
 	fs.replicators.Take(1, true)
 	defer fs.replicators.Return(1)
 
-	if part == 0 || part > 10000 {
+	if part < 0 || part >= 10000 {
 		return errors.New(fmt.Sprintf("invalid part number: %v", part))
 	}
 
+	reader, err := fh.buf.getPartReader(part)
+	if err != nil {
+		return err
+	}
 	var mpu = MultipartBlobAddInput{
 		Commit:     fh.mpuId,
-		PartNumber: part,
-		Body:       bytes.NewReader(buf.buffers[part-1].buffer),
+		PartNumber: uint32(part + 1),
+		Body:       reader,
 		//Size:       uint64(buf.Len()),
 		//Last:       last,
 		//Offset:     uint64(total - int64(buf.Len())),
 	}
-	defer func() {
-		if mpu.Body != nil {
-			bufferLog.Debugf("Free %T", buf)
-			buf.FreePart(int64(part - 1))
-		}
-	}()
-
+	fh.mpuWG.Add(1)
+	defer fh.mpuWG.Done()
 	_, err = fh.cloud.MultipartBlobAdd(&mpu)
-
 	return
 }
 
-func (fh *RandomWriteFileHandle) mpuPart(buf *MBuf, part uint32, total int64) {
-	defer func() {
-		fh.mpuWG.Done()
-	}()
-
+func (fh *RandomWriteFileHandle) mpuPart(part int) error {
 	// maybe wait for CreateMultipartUpload
 	if fh.mpuId == nil {
 		fh.mpuWG.Wait()
 		// initMPU might have errored
 		if fh.mpuId == nil {
-			return
+			return nil
 		}
 	}
 
-	err := fh.mpuPartNoSpawn(buf, part, total, false)
+	err := fh.mpuPartNoSpawn(part)
 	if err != nil {
 		if fh.lastWriteError == nil {
 			fh.lastWriteError = err
 		}
 	}
+	return err
 }
 
 func (fh *RandomWriteFileHandle) waitForCreateMPU() (err error) {
@@ -157,7 +157,7 @@ func (fh *RandomWriteFileHandle) partSize() uint64 {
 	return size
 }
 
-func (fh *RandomWriteFileHandle) WriteFileMultipart(offset int64, data []byte) (err error) {
+func (fh *RandomWriteFileHandle) WriteFile(offset int64, data []byte) (err error) {
 	fh.inode.logFuse("WriteFileMultipart", offset, len(data))
 
 	fh.mu.Lock()
@@ -172,16 +172,10 @@ func (fh *RandomWriteFileHandle) WriteFileMultipart(offset int64, data []byte) (
 		return fh.lastWriteError
 	}
 
-	if fh.buf == nil {
-		fh.buf = MBuf{}.Init(fh.poolHandle, fh.partSize(), true)
-	}
-
-	_, _ = fh.buf.Write(offset, data, func(part int64) {
-		if !fh.buf.wbufs[part] {
-			err = fh.mpuPartNoSpawn(fh.buf, uint32(part+1), BUF_SIZE, false)
-			if err == nil {
-				fh.buf.wbufs[part] = true
-			}
+	_, err = fh.buf.Write(int(offset), data, func(part int) {
+		err = fh.mpuPart(part)
+		if err != nil {
+			fh.inode.logFuse("err upload part:%v err:%v", part, err)
 		}
 	})
 	return
@@ -221,11 +215,6 @@ func (fh *RandomWriteFileHandle) ReadFile(offset int64, buf []byte) (bytesRead i
 
 func (fh *RandomWriteFileHandle) readFile(offset int64, buf []byte) (bytesRead int, err error) {
 	defer func() {
-		if bytesRead > 0 {
-			fh.readBufOffset += int64(bytesRead)
-			fh.seqReadAmount += uint64(bytesRead)
-		}
-
 		fh.inode.logFuse("< readFile", bytesRead, err)
 	}()
 
@@ -241,46 +230,14 @@ func (fh *RandomWriteFileHandle) readFile(offset int64, buf []byte) (bytesRead i
 		return
 	}
 
-	fs := fh.inode.fs
-
-	if fh.poolHandle == nil {
-		fh.poolHandle = fs.bufferPool
-	}
-
-	if fh.IsFallocateWrite {
-		part := offset / fh.buf.size
-		if int(part) >= len(fh.buf.buffers) {
-			bytesRead = -1
-		}
-		if int(offset-fh.buf.size*part) < len(fh.buf.buffers[part].buffer) {
-			bytesRead = copy(buf, fh.buf.buffers[part].buffer[offset-fh.buf.size*part:])
-		} else {
-			bytesRead = len(buf)
-			if bytesRead > cap(fh.buf.buffers[part].buffer)-int(offset-fh.buf.size*part) {
-				bytesRead = cap(fh.buf.buffers[part].buffer) - int(offset-fh.buf.size*part)
-			}
-		}
-		return
-	}
-
-	return
+	return fh.buf.Read(int(offset), buf)
 }
 
 func (fh *RandomWriteFileHandle) Release() {
 	// read buffers
 
 	// write buffers
-	if fh.poolHandle != nil {
-		if fh.buf != nil && fh.buf.buffers != nil {
-			if fh.lastWriteError == nil {
-				//panic("buf not freed but error is nil")
-			}
-
-			fh.buf.Free()
-			// the other in-flight multipart PUT buffers will be
-			// freed when they finish/error out
-		}
-	}
+	fh.buf.Free()
 
 	fh.inode.mu.Lock()
 	defer fh.inode.mu.Unlock()
@@ -290,51 +247,6 @@ func (fh *RandomWriteFileHandle) Release() {
 	}
 
 	fh.inode.fileHandles -= 1
-}
-
-func (fh *RandomWriteFileHandle) flushSmallFile() (err error) {
-	buf := fh.buf
-	fh.buf = nil
-
-	if buf == nil {
-		buf = MBuf{}.Init(fh.poolHandle, 0, true)
-	}
-
-	defer buf.Free()
-
-	fs := fh.inode.fs
-
-	fs.replicators.Take(1, true)
-	defer fs.replicators.Return(1)
-
-	// we want to get key from inode because the file could have been renamed
-	_, key := fh.inode.cloud()
-
-	var bf []byte
-	if len(buf.buffers) > 0 {
-		bf = buf.buffers[0].buffer
-	}
-
-	resp, err := fh.cloud.PutBlob(&PutBlobInput{
-		Key:         key,
-		Body:        bytes.NewReader(bf),
-		Size:        PUInt64(uint64(len(bf))),
-		ContentType: fs.flags.GetMimeType(*fh.inode.FullName()),
-	})
-	if err != nil {
-		fh.lastWriteError = err
-	} else {
-		inode := fh.inode
-		inode.mu.Lock()
-		defer inode.mu.Unlock()
-		if resp.ETag != nil {
-			inode.s3Metadata["etag"] = []byte(*resp.ETag)
-		}
-		if resp.StorageClass != nil {
-			inode.s3Metadata["storage-class"] = []byte(*resp.StorageClass)
-		}
-	}
-	return
 }
 
 func (fh *RandomWriteFileHandle) resetToKnownSize() {
@@ -384,13 +296,8 @@ func (fh *RandomWriteFileHandle) FlushFile() (err error) {
 		}
 
 		fh.writeInit = sync.Once{}
-		fh.nextWriteOffset = 0
 		fh.lastPartId = 0
 	}()
-
-	if fh.lastPartId == 0 {
-		return fh.flushSmallFile()
-	}
 
 	fh.mpuWG.Wait()
 
@@ -400,19 +307,6 @@ func (fh *RandomWriteFileHandle) FlushFile() (err error) {
 
 	if fh.mpuId == nil {
 		return
-	}
-
-	if !fh.IsFallocateWrite {
-		nParts := fh.lastPartId
-		if fh.buf != nil {
-			// upload last part
-			nParts++
-			err = fh.mpuPartNoSpawn(fh.buf, nParts, fh.nextWriteOffset, true)
-			if err != nil {
-				return
-			}
-			fh.buf = nil
-		}
 	}
 
 	_, err = fh.cloud.MultipartBlobCommit(fh.mpuId)
@@ -426,7 +320,7 @@ func (fh *RandomWriteFileHandle) FlushFile() (err error) {
 	_, key := fh.inode.cloud()
 	if *fh.mpuName != key {
 		// the file was renamed
-		err = fh.inode.renameObject(fs, PUInt64(uint64(fh.nextWriteOffset)), *fh.mpuName, *fh.inode.FullName())
+		err = fh.inode.renameObject(fs, PUInt64(uint64(fh.buf.fileSize)), *fh.mpuName, *fh.inode.FullName())
 	}
 
 	return

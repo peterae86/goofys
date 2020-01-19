@@ -10,7 +10,7 @@ require (
 	github.com/StackExchange/wmi v0.0.0-20190523213315-cbe66965904d // indirect
 	github.com/aws/aws-sdk-go v1.26.8
 	github.com/go-ole/go-ole v1.2.4 // indirect
-	github.com/google/uuid v1.1.1 // indirect
+	github.com/google/uuid v1.1.1
 	github.com/jacobsa/fuse v0.0.0-20191211084903-4898d79241b8
 	github.com/kardianos/osext v0.0.0-20190222173326-2bc1f35cddc0
 	github.com/kylelemons/godebug v1.1.0 // indirect

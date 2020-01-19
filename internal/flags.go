@@ -261,6 +261,11 @@ func NewApp() (app *cli.App) {
 				Name:  "f",
 				Usage: "Run goofys in foreground.",
 			},
+
+			cli.StringFlag{
+				Name:  "write_cache_dir",
+				Usage: "local write cache",
+			},
 		},
 	}
 
@@ -385,6 +390,10 @@ func PopulateFlags(c *cli.Context) (ret *FlagStorage) {
 			flags.Cleanup()
 		}
 	}()
+
+	if c.IsSet("write_cache_dir") {
+		flags.WriteCacheDir = c.String("write_cache_dir")
+	}
 
 	if c.IsSet("cache") {
 		cache := c.String("cache")

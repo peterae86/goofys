@@ -217,7 +217,7 @@ func NewGoofys(ctx context.Context, bucket string, flags *FlagStorage) *Goofys {
 	fs.nextHandleID = 1
 	fs.dirHandles = make(map[fuseops.HandleID]*DirHandle)
 
-	fs.fileHandles = make(map[fuseops.HandleID]*FileHandle)
+	fs.fileHandles = make(map[fuseops.HandleID]FileHandle)
 
 	fs.replicators = Ticket{Total: 16}.Init()
 	fs.restorers = Ticket{Total: 20}.Init()
@@ -1143,9 +1143,15 @@ func (fs *Goofys) Fallocate(ctx context.Context, op *fuseops.FallocateOp) (err e
 	if !ok {
 		panic(fmt.Sprintf("WriteFile: can't find handle %v", op.Handle))
 	}
-	fh.IsFallocateWrite = true
-	fh.inode.Attributes.Size = op.Length
-	fh.buf = MBuf{}.Init(fh.poolHandle, op.Length, true)
-	fh.lastPartId = uint32(len(fh.buf.buffers) - 1)
+	newFh := &RandomWriteFileHandle{
+		inode: fh.GetInode(),
+		Tgid:  fh.GetTgid(),
+		dirty: true,
+	}
+	newFh.cloud, newFh.key = newFh.inode.cloud()
+	newFh.buf = &LocalFileBuf{}
+	newFh.buf.Init(op.Length, true, fs.flags.WriteCacheDir)
+	newFh.GetInode().Attributes.Size = op.Length
+	fs.fileHandles[op.Handle] = newFh
 	return
 }

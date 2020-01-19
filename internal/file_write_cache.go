@@ -57,54 +57,38 @@ func (is *IntervalSet) len() int {
 }
 
 type InnerBuf struct {
-	file   *os.File
-	wmap   *IntervalSet
-	length int
-	cap    int
-	rp     int
-	wg     *sync.RWMutex
+	wmap       *IntervalSet
+	length     int
+	cap        int
+	rp         int
+	wg         *sync.RWMutex
+	upload     bool
+	uploadLock *sync.Mutex
 }
 
-func (ib *InnerBuf) write(offset int, bytes []byte) (n int, err error) {
-	ib.wg.Lock()
-	defer ib.wg.Unlock()
-	n, err = ib.file.WriteAt(bytes, int64(offset))
-	ib.wmap.insert(offset, offset+n)
+func (ib *InnerBuf) write(start int, end int) (n int, err error) {
+	ib.wmap.insert(start, end)
 	return
 }
 
-func (ib *InnerBuf) read(offset int, bytes []byte) (n int, err error) {
-	ib.wg.RLock()
-	defer ib.wg.RUnlock()
-	return ib.file.ReadAt(bytes, int64(offset))
+func (ib *InnerBuf) getReaderBytes() []byte {
+	return make([]byte, ib.length)
 }
 
-func (ib *InnerBuf) getReader() (io.ReadSeeker, error) {
-	ib.wg.RLock()
-	defer ib.wg.RUnlock()
-	data := make([]byte, 0, ib.length)
-	_, err := ib.file.Read(data)
-	return bytes.NewReader(data), err
-}
-
-func (ib *InnerBuf) init() error {
+func (ib *InnerBuf) init(length int) error {
 	var err error
-	ib.file, err = os.Create("/Users/" + uuid.New().String())
 	ib.wmap = &IntervalSet{
 		imap: map[int]int{},
 		keys: nil,
 	}
 	ib.wg = &sync.RWMutex{}
-	return err
-}
-
-func (ib *InnerBuf) free() error {
-	var err error
-	err = os.Remove(ib.file.Name())
+	ib.uploadLock = &sync.Mutex{}
+	ib.length = length
 	return err
 }
 
 type LocalFileBuf struct {
+	file      *os.File
 	buffers   []*InnerBuf
 	wbufs     []bool
 	bufNum    int
@@ -112,95 +96,102 @@ type LocalFileBuf struct {
 	blockSize int
 	fileSize  int
 	fileKey   string
+	path      string
 	wg        *sync.RWMutex
 }
 
-func (mb LocalFileBuf) Init(size uint64, block bool) *LocalFileBuf {
+func (mb *LocalFileBuf) Init(size uint64, block bool, path string) *LocalFileBuf {
 	mb.blockSize = BUF_SIZE * 4 //20M, max file to 200G
 	mb.fileSize = int(size)
+	mb.path = path
 	mb.wg = &sync.RWMutex{}
-
+	var err error
+	mb.file, err = os.Create(path + "/" + uuid.New().String())
+	if err != nil {
+		panic(err)
+	}
+	err = mb.file.Truncate(int64(size))
+	if err != nil {
+		panic(err)
+	}
 	if size != 0 {
 		mb.bufNum = (mb.fileSize + mb.blockSize - 1) / mb.blockSize
 		mb.wbufs = make([]bool, 0, mb.bufNum)
 		mb.buffers = make([]*InnerBuf, 0, mb.bufNum)
+		for i := 0; i < mb.bufNum; i++ {
+			mb.buffers = append(mb.buffers, &InnerBuf{})
+			var err error
+			if i == mb.bufNum-1 {
+				err = mb.buffers[i].init(int(size) - i*mb.blockSize)
+			} else {
+				err = mb.buffers[i].init(mb.blockSize)
+			}
+			if err != nil {
+				panic(err)
+			}
+		}
 	}
 
-	return &mb
+	return mb
+}
+func (mb *LocalFileBuf) getPartReader(part int) (io.ReadSeeker, error) {
+	b := mb.buffers[part].getReaderBytes()
+	_, err := mb.file.ReadAt(b, int64(part*mb.blockSize))
+	if err != nil {
+		return nil, err
+	}
+	return bytes.NewReader(b), err
 }
 
 //
 func (mb *LocalFileBuf) Read(offset int, p []byte) (n int, err error) {
-	part :=
-	if int(part) >= len(mb.buffers) {
-		err = io.EOF
-		return
-	}
-	b := mb.buffers[part]
-	if b.rp == len(b.buffer) {
-		err = io.EOF
-		return
-	}
-
-	if len(mb.rbufs) == len(mb.buffers) {
-		err = io.EOF
-		return
-	} else if len(mb.rbufs) > len(mb.buffers) {
-		panic("mb.cur > len(mb.buffers)")
-	}
-
-	n = copy(p, b.buffer[b.rp:])
-	b.rp += n
-
+	n, err = mb.file.ReadAt(p, int64(offset))
 	return
 }
 
 func (mb *LocalFileBuf) Write(offset int, p []byte, writePartFullCallback func(part int)) (n int, err error) {
-	part, partOffset := mb.offsetToPart(offset)
-	b := mb.buffers[part]
-	b.write(partOffset, p)
-	n = copy(b.buffer[start:cap(b.buffer)], p)
-	// resize the buffer to account for what we just read
-	if start+n > b.length {
-		b.length = start + n
-		b.buffer = b.buffer[:b.length]
-	}
-	b.wmap.insert(start, start+n)
-	if b.wmap.len() == b.cap {
-		if writePartFullCallback != nil {
-			writePartFullCallback(part)
+	start := 0
+	for {
+		part, partOffset := mb.offsetToPart(offset)
+		b := mb.buffers[part]
+		writeLen := b.length - partOffset
+		if start+writeLen >= len(p) {
+			writeLen = len(p) - start
 		}
-		mb.wbufs[part] = true
+		if writeLen == 0 {
+			break
+		}
+		_, _ = b.write(partOffset, partOffset+writeLen)
+		mb.wg.Lock()
+		_, err = mb.file.WriteAt(p[start:start+writeLen], int64(offset))
+		mb.wg.Unlock()
+		if err != nil {
+			return 0, err
+		}
+		start += writeLen
+		offset += writeLen
+		if b.wmap.len() == b.length {
+			go func(part int) {
+				b.uploadLock.Lock()
+				defer b.uploadLock.Unlock()
+				if !b.upload {
+					writePartFullCallback(part)
+					b.upload = true
+				}
+			}(part)
+		}
 	}
-	if n < len(p) {
-		return mb.Write(offset+n, p[n:], writePartFullCallback)
-	}
-	return
+
+	return len(p), nil
 }
 
 func (mb *LocalFileBuf) WriteFrom(offset int64, r io.Reader) (n int, err error) {
-	part := offset / mb.blockSize
-	b := mb.buffers[part]
-
-	n, err = r.Read(b.buffer[offset-part*mb.blockSize : cap(b.buffer)])
-	b.wmap.insert(int(offset-mb.blockSize*part), int(offset-mb.blockSize*part)+n)
-	// resize the buffer to account for what we just read
-	if int(offset-mb.blockSize*part)+n > b.length {
-		b.length = int(offset-mb.blockSize*part) + n
-		b.buffer = b.buffer[:int(offset-mb.blockSize*part)+n]
-	}
-	if b.wmap.len() == b.cap {
-		mb.wbufs[part] = true
-	}
-	if n > 0 {
-		return mb.WriteFrom(offset+int64(n), r)
-	} else {
-		return 0, nil
-	}
+	return 0, nil
 }
 
 func (mb *LocalFileBuf) Reset() {
-
+	mb.Free()
+	mb.Init(uint64(mb.fileSize), true, mb.path)
 }
 
 func (mb *LocalFileBuf) Close() error {
@@ -209,19 +200,8 @@ func (mb *LocalFileBuf) Close() error {
 }
 
 func (mb *LocalFileBuf) Free() {
-	for _, b := range mb.buffers {
-		_ = b.free()
-	}
-
 	mb.buffers = nil
-}
-
-func (mb *LocalFileBuf) FreePart(part int64) {
-	err := mb.buffers[part].free()
-	if err != nil {
-		println(err)
-	}
-	mb.buffers[part] = nil
+	_ = os.Remove(mb.file.Name())
 }
 
 func (mb *LocalFileBuf) offsetToPart(offset int) (int, int) {
