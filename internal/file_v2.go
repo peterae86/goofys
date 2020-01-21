@@ -47,15 +47,13 @@ func (fh *RandomWriteFileHandle) GetTgid() *int32 {
 
 func (fh *RandomWriteFileHandle) initWrite() {
 	fh.writeInit.Do(func() {
-		fh.mpuWG.Add(1)
 		go fh.initMPU()
 	})
 }
 
 func (fh *RandomWriteFileHandle) initMPU() {
-	defer func() {
-		fh.mpuWG.Done()
-	}()
+	fh.mpuWG.Add(1)
+	defer fh.mpuWG.Done()
 
 	fs := fh.inode.fs
 	fh.mpuName = &fh.key
@@ -126,10 +124,8 @@ func (fh *RandomWriteFileHandle) mpuPart(part int) error {
 
 func (fh *RandomWriteFileHandle) waitForCreateMPU() (err error) {
 	if fh.mpuId == nil {
-		fh.mu.Unlock()
 		fh.initWrite()
 		fh.mpuWG.Wait() // wait for initMPU
-		fh.mu.Lock()
 
 		if fh.lastWriteError != nil {
 			return fh.lastWriteError
@@ -160,8 +156,8 @@ func (fh *RandomWriteFileHandle) partSize() uint64 {
 func (fh *RandomWriteFileHandle) WriteFile(offset int64, data []byte) (err error) {
 	fh.inode.logFuse("WriteFileMultipart", offset, len(data))
 
-	fh.mu.Lock()
-	defer fh.mu.Unlock()
+	//fh.mu.Lock()
+	//defer fh.mu.Unlock()
 
 	err = fh.waitForCreateMPU()
 	if err != nil {

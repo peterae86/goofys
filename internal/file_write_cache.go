@@ -67,6 +67,8 @@ type InnerBuf struct {
 }
 
 func (ib *InnerBuf) write(start int, end int) (n int, err error) {
+	ib.wg.Lock()
+	defer ib.wg.Unlock()
 	ib.wmap.insert(start, end)
 	return
 }
@@ -161,10 +163,10 @@ func (mb *LocalFileBuf) Write(offset int, p []byte, writePartFullCallback func(p
 		if writeLen == 0 {
 			break
 		}
+
 		_, _ = b.write(partOffset, partOffset+writeLen)
-		mb.wg.Lock()
+
 		_, err = mb.file.WriteAt(p[start:start+writeLen], int64(offset))
-		mb.wg.Unlock()
 		if err != nil {
 			return 0, err
 		}

@@ -976,7 +976,6 @@ func (fs *Goofys) CreateFile(
 	fs.fileHandles[handleID] = fh
 
 	op.Handle = handleID
-
 	inode.logFuse("<-- CreateFile")
 
 	return
@@ -1138,20 +1137,27 @@ func (fs *Goofys) Rename(
 }
 
 func (fs *Goofys) Fallocate(ctx context.Context, op *fuseops.FallocateOp) (err error) {
-	fuseLog.Debugf("<-- Fallocate %v %v %v", op.Mode, op.Length, err)
-	fh, ok := fs.fileHandles[op.Handle]
+	fuseLog.Debugf("<-- Fallocate %v %v %v", op.Handle, op.Length, err)
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	currentFh, ok := fs.fileHandles[op.Handle]
 	if !ok {
 		panic(fmt.Sprintf("WriteFile: can't find handle %v", op.Handle))
 	}
-	newFh := &RandomWriteFileHandle{
-		inode: fh.GetInode(),
-		Tgid:  fh.GetTgid(),
-		dirty: true,
+
+	for id, fh := range fs.fileHandles {
+		if fh.GetInode().Name == currentFh.GetInode().Name {
+			newFh := &RandomWriteFileHandle{
+				inode: fh.GetInode(),
+				Tgid:  fh.GetTgid(),
+				dirty: true,
+			}
+			newFh.cloud, newFh.key = newFh.inode.cloud()
+			newFh.buf = &LocalFileBuf{}
+			newFh.buf.Init(op.Length, true, fs.flags.WriteCacheDir)
+			newFh.GetInode().Attributes.Size = op.Length
+			fs.fileHandles[id] = newFh
+		}
 	}
-	newFh.cloud, newFh.key = newFh.inode.cloud()
-	newFh.buf = &LocalFileBuf{}
-	newFh.buf.Init(op.Length, true, fs.flags.WriteCacheDir)
-	newFh.GetInode().Attributes.Size = op.Length
-	fs.fileHandles[op.Handle] = newFh
 	return
 }
