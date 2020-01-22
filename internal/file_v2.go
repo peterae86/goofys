@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"github.com/jacobsa/fuse"
 	"io"
+	"runtime/debug"
 	"sync"
 )
 
@@ -189,8 +190,8 @@ func (fh *RandomWriteFileHandle) ReadFile(offset int64, buf []byte) (bytesRead i
 		}
 	}()
 
-	fh.mu.Lock()
-	defer fh.mu.Unlock()
+	//fh.mu.Lock()
+	//defer fh.mu.Unlock()
 
 	nwant := len(buf)
 	var nread int
@@ -243,6 +244,8 @@ func (fh *RandomWriteFileHandle) Release() {
 	}
 
 	fh.inode.fileHandles -= 1
+
+	debug.FreeOSMemory()
 }
 
 func (fh *RandomWriteFileHandle) resetToKnownSize() {

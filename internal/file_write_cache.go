@@ -7,6 +7,7 @@ import (
 	"os"
 	"sort"
 	"sync"
+	"sync/atomic"
 )
 
 //
@@ -56,54 +57,122 @@ func (is *IntervalSet) len() int {
 	return total
 }
 
-type InnerBuf struct {
-	wmap       *IntervalSet
+type MarkTreeNode struct {
+	start  int
+	end    int
+	lc     atomic.Value
+	rc     atomic.Value
+	isFull bool
+}
+
+func (mt *MarkTreeNode) mark(st, ed int) bool {
+	if mt.isFull {
+		return true
+	}
+
+	if mt.end < st || mt.start > ed {
+		return mt.isFull
+	}
+	if mt.start >= st || mt.end <= ed {
+		mt.isFull = true
+		return true
+	}
+	mid := (mt.end + mt.start) >> 1
+	if mt.lc.Load() == nil {
+		mt.lc.Store(&MarkTreeNode{
+			start:  mt.start,
+			end:    mid,
+			lc:     atomic.Value{},
+			rc:     atomic.Value{},
+			isFull: false,
+		})
+	}
+	if mt.rc.Load() == nil {
+		mt.rc.Store(&MarkTreeNode{
+			start:  mid + 1,
+			end:    mt.end,
+			lc:     atomic.Value{},
+			rc:     atomic.Value{},
+			isFull: false,
+		})
+	}
+	if mt.lc.Load().(*MarkTreeNode).mark(st, ed) && mt.rc.Load().(*MarkTreeNode).mark(st, ed) {
+		mt.isFull = true
+		return true
+	} else {
+		return false
+	}
+}
+
+func (mt *MarkTreeNode) checkFull(st, ed int) bool {
+	if mt.isFull {
+		return true
+	}
+	if mt.end < st || mt.start > ed {
+		return true
+	}
+	if mt.start >= st || mt.end <= ed {
+		return mt.isFull
+	}
+	if mt.lc.Load() == nil || mt.rc.Load() == nil {
+		return false
+	}
+	if mt.lc.Load().(*MarkTreeNode).checkFull(st, ed) && mt.rc.Load().(*MarkTreeNode).checkFull(st, ed) {
+		mt.isFull = true
+		return true
+	}
+	return false
+}
+
+type InnerPart struct {
+	start      int
+	end        int
 	length     int
-	cap        int
-	rp         int
-	wg         *sync.RWMutex
 	upload     bool
 	uploadLock *sync.Mutex
 }
 
-func (ib *InnerBuf) write(start int, end int) (n int, err error) {
-	ib.wg.Lock()
-	defer ib.wg.Unlock()
-	ib.wmap.insert(start, end)
+func (ib *InnerPart) write(start int, end int) (n int, err error) {
+	//ib.wg.Lock()
+	//defer ib.wg.Unlock()
+	//ib.wmap.insert(start, end)
 	return
 }
 
-func (ib *InnerBuf) getReaderBytes() []byte {
+func (ib *InnerPart) getReaderBytes() []byte {
 	return make([]byte, ib.length)
 }
 
-func (ib *InnerBuf) init(length int) error {
-	var err error
-	ib.wmap = &IntervalSet{
-		imap: map[int]int{},
-		keys: nil,
-	}
-	ib.wg = &sync.RWMutex{}
-	ib.uploadLock = &sync.Mutex{}
-	ib.length = length
-	return err
-}
-
 type LocalFileBuf struct {
-	file      *os.File
-	buffers   []*InnerBuf
-	wbufs     []bool
-	bufNum    int
-	rp        int
-	blockSize int
-	fileSize  int
-	fileKey   string
-	path      string
-	wg        *sync.RWMutex
+	file          *os.File
+	writeMarkTree *MarkTreeNode
+	buffers       []*InnerPart
+	wbufs         []bool
+	bufNum        int
+	rp            int
+	blockSize     int
+	fileSize      int
+	fileKey       string
+	path          string
+	wg            *sync.RWMutex
 }
 
 func (mb *LocalFileBuf) Init(size uint64, block bool, path string) *LocalFileBuf {
-	mb.blockSize = BUF_SIZE * 4 //20M, max file to 200G
+	sizeRange := 1
+	for {
+		if sizeRange > int(size) {
+			break
+		}
+		sizeRange = sizeRange << 1
+	}
+	mb.writeMarkTree = &MarkTreeNode{
+		start:  0,
+		end:    sizeRange - 1,
+		lc:     atomic.Value{},
+		rc:     atomic.Value{},
+		isFull: false,
+	}
+	mb.blockSize = 4 * 4 * 1024 * 1024 //16M, max file to 200G
 	mb.fileSize = int(size)
 	mb.path = path
 	mb.wg = &sync.RWMutex{}
@@ -119,17 +188,24 @@ func (mb *LocalFileBuf) Init(size uint64, block bool, path string) *LocalFileBuf
 	if size != 0 {
 		mb.bufNum = (mb.fileSize + mb.blockSize - 1) / mb.blockSize
 		mb.wbufs = make([]bool, 0, mb.bufNum)
-		mb.buffers = make([]*InnerBuf, 0, mb.bufNum)
+		mb.buffers = make([]*InnerPart, 0, mb.bufNum)
 		for i := 0; i < mb.bufNum; i++ {
-			mb.buffers = append(mb.buffers, &InnerBuf{})
-			var err error
 			if i == mb.bufNum-1 {
-				err = mb.buffers[i].init(int(size) - i*mb.blockSize)
+				mb.buffers = append(mb.buffers, &InnerPart{
+					start:      i * mb.blockSize,
+					end:        int(size) - 1,
+					length:     int(size) - i*mb.blockSize,
+					upload:     false,
+					uploadLock: &sync.Mutex{},
+				})
 			} else {
-				err = mb.buffers[i].init(mb.blockSize)
-			}
-			if err != nil {
-				panic(err)
+				mb.buffers = append(mb.buffers, &InnerPart{
+					start:      i * mb.blockSize,
+					end:        (i+1)*mb.blockSize - 1,
+					length:     mb.blockSize,
+					upload:     false,
+					uploadLock: &sync.Mutex{},
+				})
 			}
 		}
 	}
@@ -153,6 +229,11 @@ func (mb *LocalFileBuf) Read(offset int, p []byte) (n int, err error) {
 
 func (mb *LocalFileBuf) Write(offset int, p []byte, writePartFullCallback func(part int)) (n int, err error) {
 	start := 0
+	_, err = mb.file.WriteAt(p, int64(offset))
+	if err != nil {
+		return 0, err
+	}
+	mb.writeMarkTree.mark(offset, offset+len(p)-1)
 	for {
 		part, partOffset := mb.offsetToPart(offset)
 		b := mb.buffers[part]
@@ -163,16 +244,9 @@ func (mb *LocalFileBuf) Write(offset int, p []byte, writePartFullCallback func(p
 		if writeLen == 0 {
 			break
 		}
-
-		_, _ = b.write(partOffset, partOffset+writeLen)
-
-		_, err = mb.file.WriteAt(p[start:start+writeLen], int64(offset))
-		if err != nil {
-			return 0, err
-		}
 		start += writeLen
 		offset += writeLen
-		if b.wmap.len() == b.length {
+		if mb.writeMarkTree.checkFull(b.start, b.end) {
 			go func(part int) {
 				b.uploadLock.Lock()
 				defer b.uploadLock.Unlock()
@@ -203,6 +277,7 @@ func (mb *LocalFileBuf) Close() error {
 
 func (mb *LocalFileBuf) Free() {
 	mb.buffers = nil
+	mb.writeMarkTree = nil
 	_ = os.Remove(mb.file.Name())
 }
 

@@ -35,6 +35,9 @@ import (
 	"github.com/urfave/cli"
 
 	daemon "github.com/sevlyar/go-daemon"
+
+	"net/http"
+	_ "net/http/pprof"
 )
 
 var log = GetLogger("main")
@@ -137,6 +140,14 @@ func main() {
 	VersionHash = Version
 
 	massagePath()
+
+	go func() {
+		err2 := http.ListenAndServe("0.0.0.0:6060", nil)
+
+		if err2 != nil {
+			println(err2)
+		}
+	}()
 
 	app := NewApp()
 
